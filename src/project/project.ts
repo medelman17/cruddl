@@ -5,7 +5,7 @@ import { DEFAULT_LOGGER_PROVIDER, LoggerProvider } from '../config/logging';
 import { DatabaseAdapter, DatabaseAdapterTimings } from '../database/database-adapter';
 import { getMetaSchema } from '../meta-schema/meta-schema';
 import { Model, ValidationResult } from '../model';
-import { createSchema, getModel, validateSchema } from '../schema/schema-builder';
+import { createSchema, createSchemaExecutor, getModel, SchemaExecutor, validateSchema } from '../schema/schema-builder';
 import { ProjectSource, SourceLike, SourceType } from './source';
 
 export interface RequestProfile {
@@ -42,7 +42,7 @@ export class Project {
 
     readonly loggerProvider: LoggerProvider;
 
-    readonly options: ProjectOptions
+    readonly options: ProjectOptions;
 
     constructor(config: ProjectConfig | SourceLike[]) {
         if (isArray(config)) {
@@ -78,6 +78,10 @@ export class Project {
      */
     createSchema(databaseAdapter: DatabaseAdapter): GraphQLSchema {
         return createSchema(this, databaseAdapter);
+    }
+
+    createSchemaExecutor(databaseAdapter: DatabaseAdapter): SchemaExecutor {
+        return createSchemaExecutor(this, databaseAdapter);
     }
 
     /**

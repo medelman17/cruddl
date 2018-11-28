@@ -7,6 +7,7 @@ import { Model } from '../model';
 import { ObjectQueryNode, QueryNode } from '../query-tree';
 import { evaluateQueryStatically } from '../query-tree/utils';
 import { SchemaTransformationContext } from '../schema/preparation/transformation-pipeline';
+import { ExecutionCache } from '../schema/schema-builder';
 import { getPreciseTime, Watch } from '../utils/watch';
 import { buildConditionalObjectQueryNode, QueryNodeObjectType, QueryNodeObjectTypeConverter } from './query-node-object-type';
 import { RootTypesGenerator } from './root-types-generator';
@@ -22,19 +23,26 @@ export class SchemaGenerator {
     }
 
     generate(model: Model) {
-        const queryType = this.rootTypesGenerator.generateQueryType(model);
-        const mutationType = this.rootTypesGenerator.generateMutationType(model);
-        const dumbSchema = new GraphQLSchema({
-            query: this.queryNodeObjectTypeConverter.convertToGraphQLObjectType(queryType),
-            mutation: this.queryNodeObjectTypeConverter.convertToGraphQLObjectType(mutationType)
-        });
+        const { queryType, mutationType, dumbSchema } = this.generateTypesAndDumpSchema(model);
         return addOperationBasedResolvers(dumbSchema, op => {
             const rootType = op.operation.operation === 'mutation' ? mutationType : queryType;
             return this.resolveOperation(op, rootType);
         });
     }
 
-    private async resolveOperation(operationInfo: OperationParams, rootType: QueryNodeObjectType) {
+    generateTypesAndDumpSchema(model: Model) {
+        const queryType = this.rootTypesGenerator.generateQueryType(model);
+        const mutationType = this.rootTypesGenerator.generateMutationType(model);
+        const dumbSchema = new GraphQLSchema({
+            query: this.queryNodeObjectTypeConverter.convertToGraphQLObjectType(queryType),
+            mutation: this.queryNodeObjectTypeConverter.convertToGraphQLObjectType(mutationType)
+        });
+        return {
+            queryType, mutationType, dumbSchema
+        };
+    }
+
+    async resolveOperation(operationInfo: OperationParams, rootType: QueryNodeObjectType) {
         globalContext.registerContext(this.context);
         let profileConsumer = this.context.profileConsumer;
         const logger = globalContext.loggerProvider.getLogger('query-resolvers');

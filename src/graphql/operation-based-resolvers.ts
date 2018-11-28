@@ -1,5 +1,5 @@
 import {
-    defaultFieldResolver,
+    defaultFieldResolver, execute,
     FragmentDefinitionNode, GraphQLFieldConfigMap, GraphQLFieldResolver, GraphQLObjectType, GraphQLSchema,
     OperationDefinitionNode
 } from 'graphql';

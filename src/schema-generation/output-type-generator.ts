@@ -54,6 +54,7 @@ export class OutputTypeGenerator {
         };
     }
 
+    @memorize()
     private getFields(objectType: ObjectType): ReadonlyArray<QueryNodeField> {
         const origFields = [...objectType.fields];
         origFields.filter(field => field.isReference);

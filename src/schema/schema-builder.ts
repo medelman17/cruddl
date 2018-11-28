@@ -1,27 +1,21 @@
-import { DocumentNode, getLocation, GraphQLError, GraphQLSchema, parse } from 'graphql';
+import { DocumentNode, ExecutionResult, FragmentDefinitionNode, getLocation, GraphQLError, GraphQLSchema, parse, VariableDefinitionNode } from 'graphql';
+import { getVariableValues } from 'graphql/execution/values';
+import Maybe from 'graphql/tsutils/Maybe';
 import { parse as JSONparse } from 'json-source-map';
 import { compact } from 'lodash';
-import {
-    Kind, load, YAMLAnchorReference, YamlMap, YAMLMapping, YAMLNode, YAMLScalar, YAMLSequence
-} from 'yaml-ast-parser';
+import { Kind, load, YAMLAnchorReference, YamlMap, YAMLMapping, YAMLNode, YAMLScalar, YAMLSequence } from 'yaml-ast-parser';
 import { globalContext } from '../config/global';
-import {
-    ParsedGraphQLProjectSource, ParsedObjectProjectSource, ParsedProject, ParsedProjectSource,
-    ParsedProjectSourceBaseKind
-} from '../config/parsed-project';
+import { ParsedGraphQLProjectSource, ParsedObjectProjectSource, ParsedProject, ParsedProjectSource, ParsedProjectSourceBaseKind } from '../config/parsed-project';
 import { DatabaseAdapter } from '../database/database-adapter';
-import {
-    createModel, Model, Severity, SourcePosition, ValidationContext, ValidationMessage, ValidationResult
-} from '../model';
+import { extractOperation } from '../graphql/operations';
+import { createModel, Model, Severity, SourcePosition, ValidationContext, ValidationMessage, ValidationResult } from '../model';
 import { MessageLocation } from '../model/';
 import { Project } from '../project/project';
 import { ProjectSource, SourceType } from '../project/source';
 import { SchemaGenerator } from '../schema-generation';
-import { flatMap, PlainObject } from '../utils/utils';
+import { arrayToObject, flatMap, PlainObject } from '../utils/utils';
 import { validateParsedProjectSource, validatePostMerge, validateSource } from './preparation/ast-validator';
-import {
-    executePreMergeTransformationPipeline, executeSchemaTransformationPipeline, SchemaTransformationContext
-} from './preparation/transformation-pipeline';
+import { executePreMergeTransformationPipeline, executeSchemaTransformationPipeline, SchemaTransformationContext } from './preparation/transformation-pipeline';
 import { getLineEndPosition } from './schema-utils';
 import jsonLint = require('json-lint');
 import stripJsonComments = require('strip-json-comments');
@@ -30,7 +24,7 @@ import stripJsonComments = require('strip-json-comments');
  * Validates a project and thus determines whether createSchema() would succeed
  */
 export function validateSchema(project: Project): ValidationResult {
-    globalContext.registerContext({loggerProvider: project.loggerProvider});
+    globalContext.registerContext({ loggerProvider: project.loggerProvider });
     try {
         return validateAndPrepareSchema(project).validationResult;
     } finally {
@@ -51,7 +45,7 @@ function validateAndPrepareSchema(project: Project): { validationResult: Validat
         return [source];
     });
 
-    const parsedProject = parseProject(new Project({...project.options, sources}), validationContext);
+    const parsedProject = parseProject(new Project({ ...project.options, sources }), validationContext);
 
     parsedProject.sources.forEach(parsedSource => validationContext.addMessage(...validateParsedProjectSource(parsedSource).messages));
 
@@ -65,7 +59,7 @@ function validateAndPrepareSchema(project: Project): { validationResult: Validat
     validationContext.addMessage(...result.messages);
     validationContext.addMessage(...model.validate().messages);
 
-    return {validationResult: validationContext.asResult(), model};
+    return { validationResult: validationContext.asResult(), model };
 }
 
 /**
@@ -75,11 +69,11 @@ function validateAndPrepareSchema(project: Project): { validationResult: Validat
  Use the optional context to inject your logging framework.
  */
 export function createSchema(project: Project, databaseAdapter: DatabaseAdapter): GraphQLSchema {
-    globalContext.registerContext({loggerProvider: project.loggerProvider});
+    globalContext.registerContext({ loggerProvider: project.loggerProvider });
     try {
         const logger = globalContext.loggerProvider.getLogger('schema-builder');
 
-        const {validationResult, model} = validateAndPrepareSchema(project);
+        const { validationResult, model } = validateAndPrepareSchema(project);
         if (validationResult.hasErrors()) {
             throw new Error('Project has errors:\n' + validationResult.toString());
         }
@@ -99,11 +93,82 @@ export function createSchema(project: Project, databaseAdapter: DatabaseAdapter)
     }
 }
 
+interface SchemaExecutionArgs {
+    readonly document: DocumentNode;
+    readonly contextValue?: any;
+    readonly variableValues?: Maybe<{ [key: string]: any }>;
+    readonly operationName?: Maybe<string>;
+    readonly cache?: ExecutionCache;
+}
+
+export interface ExecutionCache {
+
+}
+
+export interface SchemaExecutor {
+    tryExecute(args: SchemaExecutionArgs): Promise<ExecutionResult<any>> | undefined
+}
+
+/**
+ Create an executable schema for a given schema definition.
+ A schema definition is an array of definition parts, represented
+ as a (sourced) SDL string or AST document.
+ Use the optional context to inject your logging framework.
+ */
+export function createSchemaExecutor(project: Project, databaseAdapter: DatabaseAdapter): SchemaExecutor {
+    globalContext.registerContext({ loggerProvider: project.loggerProvider });
+    try {
+        const logger = globalContext.loggerProvider.getLogger('schema-builder');
+
+        const { validationResult, model } = validateAndPrepareSchema(project);
+        if (validationResult.hasErrors()) {
+            throw new Error('Project has errors:\n' + validationResult.toString());
+        }
+
+        const schemaContext: SchemaTransformationContext = {
+            ...project.options,
+            databaseAdapter
+        };
+
+        const generator = new SchemaGenerator(schemaContext);
+        const { dumbSchema, queryType, mutationType } = generator.generateTypesAndDumpSchema(model);
+        return {
+            tryExecute(args: SchemaExecutionArgs): Promise<ExecutionResult<any>> | undefined {
+                const operation = extractOperation(args.document, args.operationName);
+                // TODO check for introspection in fragments
+                if (operation.selectionSet.selections.some(sel => sel.kind === 'Field' && sel.name.value.startsWith('__'))) {
+                    // contains introspection query
+                    return undefined;
+                }
+                const fragments = args.document.definitions.filter(def => def.kind === 'FragmentDefinition') as ReadonlyArray<FragmentDefinitionNode>;
+                const fragmentMap = arrayToObject(fragments, fr => fr.name.value);
+
+                // this is a deep import, might want to import the function
+                const { coerced: variableValues, errors: variableErrors } = getVariableValues(dumbSchema, operation.variableDefinitions as VariableDefinitionNode[] || [], args.variableValues || {});
+                if (variableErrors) {
+                    return undefined;
+                }
+
+                const rootType = operation.operation === 'mutation' ? mutationType : queryType;
+                return generator.resolveOperation({
+                    context: args.contextValue,
+                    operation,
+                    fragments: fragmentMap,
+                    schema: dumbSchema,
+                    variableValues: variableValues || {}
+                }, rootType);
+            }
+        };
+    } finally {
+        globalContext.unregisterContext();
+    }
+}
+
 
 export function getModel(project: Project): Model {
-    globalContext.registerContext({loggerProvider: project.loggerProvider});
+    globalContext.registerContext({ loggerProvider: project.loggerProvider });
     try {
-        const {model} = validateAndPrepareSchema(project);
+        const { model } = validateAndPrepareSchema(project);
         return model;
     } finally {
         globalContext.unregisterContext();
@@ -111,7 +176,7 @@ export function getModel(project: Project): Model {
 }
 
 function mergeSchemaDefinition(parsedProject: ParsedProject): DocumentNode {
-    const emptyDocument: DocumentNode = {kind: 'Document', definitions: []};
+    const emptyDocument: DocumentNode = { kind: 'Document', definitions: [] };
     const graphqlDocuments = parsedProject.sources.map(s => {
         if (s.kind === ParsedProjectSourceBaseKind.GRAPHQL) {
             return s.document;
@@ -184,7 +249,7 @@ function parseJSONSource(projectSource: ProjectSource, validationContext: Valida
     }
 
     // perform general JSON syntax check
-    const lintResult = jsonLint(projectSource.body, {comments: true});
+    const lintResult = jsonLint(projectSource.body, { comments: true });
     if (lintResult.error) {
         let loc: MessageLocation | undefined;
         if (typeof lintResult.line == 'number' && typeof lintResult.i == 'number' && typeof lintResult.character == 'number') {
@@ -199,7 +264,7 @@ function parseJSONSource(projectSource: ProjectSource, validationContext: Valida
     const jsonPathLocationMap: { [path: string]: MessageLocation } = {};
 
     // whitespace: true replaces non-whitespace in comments with spaces so that the sourcemap still matches
-    const bodyWithoutComments = stripJsonComments(projectSource.body, {whitespace: true});
+    const bodyWithoutComments = stripJsonComments(projectSource.body, { whitespace: true });
     const parseResult = JSONparse(bodyWithoutComments);
     const pointers = parseResult.pointers;
 
@@ -300,7 +365,7 @@ function extractAllPaths(node: YAMLNode, curPath: ReadonlyArray<(string | number
             const mappingNode = node as YAMLMapping;
             if (mappingNode.value) {
                 return [
-                    {path: [...curPath, mappingNode.key.value], node: mappingNode},
+                    { path: [...curPath, mappingNode.key.value], node: mappingNode },
                     ...extractAllPaths(mappingNode.value, [...curPath, mappingNode.key.value])
                 ];
             }
@@ -308,9 +373,9 @@ function extractAllPaths(node: YAMLNode, curPath: ReadonlyArray<(string | number
         case Kind.SCALAR:
             const scalarNode = node as YAMLScalar;
             if (scalarNode.parent && scalarNode.parent.kind == Kind.SEQ) {
-                return [{path: curPath, node: scalarNode}];
+                return [{ path: curPath, node: scalarNode }];
             } else {
-                return [{path: curPath, node: scalarNode.parent}];
+                return [{ path: curPath, node: scalarNode.parent }];
             }
         case Kind.SEQ:
             const seqNode = node as YAMLSequence;
@@ -322,7 +387,7 @@ function extractAllPaths(node: YAMLNode, curPath: ReadonlyArray<(string | number
             const refNode = node as YAMLAnchorReference;
             return extractAllPaths(refNode.value, [...curPath]);
     }
-    return [{path: curPath, node: node}];
+    return [{ path: curPath, node: node }];
 }
 
 export function extractJSONFromYAML(root: YAMLNode, validationContext: ValidationContext, source: ProjectSource): PlainObject | undefined {
